@@ -18,6 +18,7 @@ from orbits.twobody import orbital_quantities
 
 TWO_PI = 2.0 * np.pi
 CIRCULAR_E_TOL = 1e-12  # below this the eccentricity vector (and theta) is undefined
+SIN_DTHETA_TOL = 1e-10  # below this the Curtis dtheta form of fd is singular
 
 
 def _check_elliptic(e: float) -> None:
@@ -135,6 +136,22 @@ def theta_to_E(theta: float, e: float) -> float:
     return float(np.mod(E, TWO_PI))
 
 
+def _true_anomaly(r: np.ndarray, v: np.ndarray, e_vec: np.ndarray) -> float:
+    """True anomaly from the state vector and the eccentricity vector (Curtis, eq. 4.13a).
+
+        theta = arccos(e_vec . r / (e |r|)),  theta -> 2pi - theta if r . v < 0
+
+    Raises ValueError for a (near-)circular orbit, where e_vec and theta are undefined.
+    """
+    e = np.linalg.norm(e_vec)
+    if e < CIRCULAR_E_TOL:
+        raise ValueError(f"True anomaly is undefined for a (near-)circular orbit, e={e:.3e}")
+    theta = np.arccos(np.clip(np.dot(e_vec, r) / (e * np.linalg.norm(r)), -1.0, 1.0))
+    if np.dot(r, v) < 0:  # moving towards perigee: second half of the orbit
+        theta = TWO_PI - theta
+    return float(theta)
+
+
 def orbit_timing(r0: ArrayLike, v0: ArrayLike, mu: float = MU_EARTH) -> dict[str, float]:
     """Compute anomalies and timing of an elliptical orbit from a state vector.
 
@@ -169,13 +186,7 @@ def orbit_timing(r0: ArrayLike, v0: ArrayLike, mu: float = MU_EARTH) -> dict[str
     if not q.is_closed:
         raise ValueError("orbit_timing requires an elliptical orbit (specific energy < 0)")
     e = q.e_norm
-    if e < CIRCULAR_E_TOL:
-        raise ValueError(f"True anomaly is undefined for a (near-)circular orbit, e={e:.3e}")
-
-    cos_theta0 = np.dot(q.e_vec, r0) / (e * q.r_norm)
-    theta0 = np.arccos(np.clip(cos_theta0, -1.0, 1.0))
-    if np.dot(r0, v0) < 0:  # moving towards perigee: second half of the orbit
-        theta0 = TWO_PI - theta0
+    theta0 = _true_anomaly(r0, v0, q.e_vec)
 
     E0 = theta_to_E(theta0, e)
     M0 = E0 - e * np.sin(E0)
@@ -191,3 +202,141 @@ def orbit_timing(r0: ArrayLike, v0: ArrayLike, mu: float = MU_EARTH) -> dict[str
         "T": float(TWO_PI / n),
         "t0": float(M0 / n),
     }
+
+
+def propagate_kepler(
+    r0: ArrayLike,
+    v0: ArrayLike,
+    dt: float,
+    mu: float = MU_EARTH,
+    return_coeffs: bool = False,
+) -> Union[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]]]:
+    """Propagate an elliptical two-body orbit analytically by dt.
+
+    Lagrange coefficients written in terms of the eccentric-anomaly increment
+    dE (Curtis, ch. 3; equivalent to the universal-variable form of
+    Mengali, ch. 4, with chi = sqrt(a) dE):
+
+        a      = 1 / (2/r0 - v0^2/mu),  n = sqrt(mu/a^3)
+        e cosE0 = 1 - r0/a,  e sinE0 = (r0 . v0) / sqrt(mu a)
+        M      = E0 - e sin(E0) + n dt  ->  E from Kepler's equation
+        dE     = E + 2pi floor(M / 2pi) - E0      (unwrapped increment)
+        r      = a (1 - e cos E)
+        f  = 1 - (a/r0)(1 - cos dE)          g  = dt - (dE - sin dE)/n
+        fd = -sqrt(mu a) sin(dE) / (r r0)    gd = 1 - (a/r)(1 - cos dE)
+        r_vec = f r0 + g v0,  v_vec = fd r0 + gd v0
+
+    No term divides by sin(dtheta), so the formulation is regular for any dt
+    (negative, multi-revolution, dtheta = k pi) and also for near-circular
+    orbits, where theta and the eccentricity vector are ill-defined.
+
+    Parameters
+    ----------
+    r0, v0 : array_like, shape (3,)
+        Initial position [km] and velocity [km/s].
+    dt : float
+        Time of flight [s]; may be negative or longer than one period.
+    mu : float
+        Gravitational parameter [km^3/s^2].
+    return_coeffs : bool
+        If True, also return the Lagrange coefficients (f, g, fd, gd).
+
+    Returns
+    -------
+    (r, v) or (r, v, (f, g, fd, gd))
+        Position [km] and velocity [km/s] at t0 + dt; f, gd [-], g [s], fd [1/s].
+
+    Raises
+    ------
+    ValueError
+        If the orbit is not elliptical (a <= 0).
+    """
+    r0 = np.asarray(r0, dtype=float)
+    v0 = np.asarray(v0, dtype=float)
+    r0n = np.linalg.norm(r0)
+
+    a = 1.0 / (2.0 / r0n - np.dot(v0, v0) / mu)
+    if a <= 0:
+        raise ValueError(f"propagate_kepler requires an elliptical orbit, got a={a:.6g} km")
+    n = np.sqrt(mu / a**3)
+
+    ecosE0 = 1.0 - r0n / a
+    esinE0 = np.dot(r0, v0) / np.sqrt(mu * a)
+    e = np.hypot(ecosE0, esinE0)
+    E0 = np.arctan2(esinE0, ecosE0)
+
+    M_tot = E0 - e * np.sin(E0) + n * dt  # not reduced: keeps the revolution count
+    E = kepler_solve(M_tot, e)  # E corresponds to M_tot reduced to [0, 2pi)
+    # Restore the full revolutions removed by the reduction; without this, g is
+    # wrong as soon as M_tot leaves [0, 2pi) (multi-revolution or negative dt).
+    dE = E + TWO_PI * np.floor(M_tot / TWO_PI) - E0
+    r = a * (1.0 - e * np.cos(E))
+
+    f = 1.0 - (a / r0n) * (1.0 - np.cos(dE))
+    g = dt - (dE - np.sin(dE)) / n
+    fd = -np.sqrt(mu * a) * np.sin(dE) / (r * r0n)
+    gd = 1.0 - (a / r) * (1.0 - np.cos(dE))
+
+    r_vec = f * r0 + g * v0
+    v_vec = fd * r0 + gd * v0
+    if return_coeffs:
+        return r_vec, v_vec, (float(f), float(g), float(fd), float(gd))
+    return r_vec, v_vec
+
+
+def lagrange_coeffs_theta(
+    r0: ArrayLike, v0: ArrayLike, dtheta: float, mu: float = MU_EARTH
+) -> tuple[float, float, float, float]:
+    """Lagrange coefficients as functions of the true-anomaly increment dtheta.
+
+    Curtis form (sec. 2.11, "The Lagrange coefficients"), used here only to cross-check
+    ``propagate_kepler``:
+
+        h = |r0 x v0|,  theta = theta0 + dtheta,  r = (h^2/mu) / (1 + e cos theta)
+        f  = 1 - (mu r / h^2)(1 - cos dtheta)
+        g  = (r r0 / h) sin dtheta
+        fd = (mu/h) ((1 - cos dtheta)/sin dtheta) ((mu/h^2)(1 - cos dtheta) - 1/r0 - 1/r)
+        gd = 1 - (mu r0 / h^2)(1 - cos dtheta)
+
+    fd divides by sin(dtheta), so this form is singular for dtheta = k pi
+    (e.g. dt = T, or dt = T/2 from perigee). This is why ``propagate_kepler``
+    uses the dE form instead.
+
+    Parameters
+    ----------
+    r0, v0 : array_like, shape (3,)
+        Initial position [km] and velocity [km/s].
+    dtheta : float
+        True-anomaly increment [rad].
+    mu : float
+        Gravitational parameter [km^3/s^2].
+
+    Returns
+    -------
+    (f, g, fd, gd)
+        f, gd [-], g [s], fd [1/s].
+
+    Raises
+    ------
+    ValueError
+        If |sin(dtheta)| < 1e-10 (singular form), or the orbit is circular.
+    """
+    if abs(np.sin(dtheta)) < SIN_DTHETA_TOL:
+        raise ValueError(
+            f"Curtis f, g form is singular for dtheta = k*pi (sin(dtheta) = {np.sin(dtheta):.1e}); "
+            "use propagate_kepler instead"
+        )
+    r0 = np.asarray(r0, dtype=float)
+    v0 = np.asarray(v0, dtype=float)
+    q = orbital_quantities(r0, v0, mu)
+    h = q.h_norm
+    r0n = q.r_norm
+    theta = _true_anomaly(r0, v0, q.e_vec) + dtheta
+    r = (h**2 / mu) / (1.0 + q.e_norm * np.cos(theta))
+
+    one_minus_cos = 1.0 - np.cos(dtheta)
+    f = 1.0 - (mu * r / h**2) * one_minus_cos
+    g = (r * r0n / h) * np.sin(dtheta)
+    fd = (mu / h) * (one_minus_cos / np.sin(dtheta)) * ((mu / h**2) * one_minus_cos - 1.0 / r0n - 1.0 / r)
+    gd = 1.0 - (mu * r0n / h**2) * one_minus_cos
+    return float(f), float(g), float(fd), float(gd)
