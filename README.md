@@ -85,6 +85,19 @@ Reference values are tabulated in the test files to 3 decimals (km) and 5 decima
 (rad, km/s); tolerances match the number of quoted digits and are never widened to
 make a test pass.
 
+### Where the reference values come from
+
+- **Solver and propagation tables**: generated with an independent Python script
+  (separate from this repository) and cross-checked against hand calculations of the
+  anomalies and time since perigee for orbit A.
+- **Textbook cases**: the initial state of orbit A and the solver case
+  `(M = 3.6029 rad, e = 0.37255)` are taken from Curtis, *Orbital Mechanics for
+  Engineering Students*, Examples 4.3 and 3.2.
+- **Method-independent checks**: several tests need no tabulated value at all. They
+  compare the `dE` form of the Lagrange coefficients against Curtis' `dtheta` form,
+  compare against `solve_ivp` at tight tolerances, and check physical invariants
+  (energy, `|h|`, `f gd - fd g = 1`, periodicity, perpendicular velocity at apogee).
+
 ## Known limitations
 
 - Elliptical orbits only: no parabolic or hyperbolic trajectories (the natural
