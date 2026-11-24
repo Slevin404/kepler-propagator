@@ -11,7 +11,7 @@ from orbits.kepler import (
     orbit_timing,
     propagate_kepler,
 )
-from orbits.twobody import orbital_quantities
+from orbits.twobody import orbital_quantities, propagate
 
 # Orbit A (same as Project 1).
 R0_A = np.array([-6045.0, -3490.0, 2500.0])  # km
@@ -152,3 +152,10 @@ def test_hyperbolic_orbit_rejected() -> None:
     v0 = 1.5 * v_escape * V0_A / np.linalg.norm(V0_A)
     with pytest.raises(ValueError):
         propagate_kepler(R0_A, v0, 1000.0)
+
+
+def test_matches_solve_ivp_with_tight_tolerances() -> None:
+    dt = 3600.0
+    sol = propagate(R0_A, V0_A, dt, 2, rtol=1e-10, atol=1e-12)  # RK45, as in Project 1
+    r, _ = propagate_kepler(R0_A, V0_A, dt)
+    assert np.linalg.norm(r - sol.y[:3, -1]) < 1e-3
